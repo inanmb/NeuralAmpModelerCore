@@ -135,9 +135,6 @@ private:
   #endif
 
   // Single contiguous allocation for all 23 layers' history buffers.
-  // Placing them in one arena rather than 23 separate vectors distributes
-  // their base addresses across cache sets, reducing L1 set-conflict misses
-  // on narrow caches (e.g. Cortex-A8 with 16KB / 4-way = 4KB set stride).
   std::vector<float> _history_arena;
 
   // Working buffers (all Channels rows, max_buffer_size cols, col-major).
@@ -156,11 +153,8 @@ private:
   // Compile-time-specialized per-layer kernel. KernelSize is lifted to a
   // template parameter so clang can fully unroll the tap loop and schedule
   // FMAs across taps. For the A2 shape we only need K=6 and K=15.
-  // IsFirst: true for layer 0 only. Selects = vs += when writing the head
-  // accumulator directly into _head_history, avoiding a separate zeroing pass.
-  // IsLast: true for the final layer only. Its layer1x1 residual output feeds
-  // no downstream layer (the model output flows through _head_history ->
-  // _head_forward), so the 1x1 projection + residual store are dead and elided.
+  // IsFirst: layer 0 assigns into _head_history; others accumulate.
+  // IsLast: layer1x1 residual elided (dead output on final layer).
   template <int KernelSize, bool IsFirst, bool IsLast>
   void _layer_forward_k(Layer& L, const float* cond, int num_frames, int head_wp);
 };
@@ -307,7 +301,6 @@ void A2FastModel<Channels>::SetMaxBufferSize(int maxBufferSize)
   _cond.assign(static_cast<size_t>(maxBufferSize), 0.0f);
   _head_out.assign(static_cast<size_t>(maxBufferSize), 0.0f);
 
-  // Compute per-layer slot sizes, then allocate one contiguous arena.
   std::array<size_t, kNumLayers> slot_sizes{};
   size_t arena_total = 0;
   for (int i = 0; i < kNumLayers; i++)
@@ -347,12 +340,9 @@ void A2FastModel<Channels>::SetMaxBufferSize(int maxBufferSize)
 
 // -----------------------------------------------------------------------------
 // Ring-write helpers.
-//   Mode 1: pow2 + tail mirror, mirror-on-demand. Reads in _layer_forward_k
-//   use `tap_base + f` without masking, so the mirror region at
-//   [pow2_size, pow2_size + mbs) must cover any reads that overflow past
-//   pow2_size. After each write, predict where the next call's tap reads will
-//   land and mirror only the columns that actually overflow — frequently zero.
-//   Avoids the full mbs*Channels*4 memcpy that a naive refresh would do.
+//   Mode 1: pow2 + tail mirror, mirror-on-demand. After each write, compute
+//   each tap's next-call read range and mirror only columns that overflow past
+//   pow2_size. Frequently zero copy.
 //   Mode 0: linear with periodic memmove rewind.
 // -----------------------------------------------------------------------------
 template <int Channels>
@@ -370,9 +360,6 @@ void A2FastModel<Channels>::_ring_write(Layer& L, int num_frames)
                 static_cast<size_t>(num_frames - first) * Channels * sizeof(float));
   }
   const int new_wp = (wp + num_frames) & L.pow2_mask;
-
-  // Mirror-on-demand: for each tap, predict the read range in the next call
-  // and mirror only the columns that would overflow past pow2_size.
   int mirror_needed = 0;
   const int K = L.kernel_size;
   const int D = L.dilation;
@@ -387,7 +374,6 @@ void A2FastModel<Channels>::_ring_write(Layer& L, int num_frames)
   if (mirror_needed > 0)
     std::memcpy(hist + static_cast<size_t>(L.pow2_size) * Channels, hist,
                 static_cast<size_t>(mirror_needed) * Channels * sizeof(float));
-
   L.write_pos = new_wp;
   #else
   if (L.write_pos + num_frames > L.history_cols)
@@ -408,20 +394,12 @@ void A2FastModel<Channels>::_ring_write(Layer& L, int num_frames)
 // after applying dilated conv + mixin + LeakyReLU + layer1x1 residual, and
 // writes/accumulates activations directly into _head_history at head_wp.
 // -----------------------------------------------------------------------------
-// Compile-time-specialized per-layer kernel. KernelSize is a template param
-// so the K tap loop + per-tap weight offsets become compile-time constants;
-// clang fully unrolls and can schedule FMAs across taps. Called from the
-// runtime dispatcher below for each A2 kernel size (6 and 15).
 template <int Channels>
 template <int KernelSize, bool IsFirst, bool IsLast>
 void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int num_frames, int head_wp)
 {
   constexpr int K = KernelSize;
   const int D = L.dilation;
-  // Physical ring position of this block's first frame, offset by `taps_back *
-  // D` samples into the past. In pow2 mode the position is wrapped by mask and
-  // reads spanning the wrap land in the tail mirror; in linear mode write_pos
-  // is monotonic and arithmetic is plain.
   #if NAM_A2_RING_MODE == 1
   const int mask = L.pow2_mask;
   auto tap_base_phys = [&](int taps_back) { return (L.write_pos - num_frames - taps_back * D) & mask; };
@@ -430,32 +408,9 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
   auto tap_base_phys = [&](int taps_back) { return base - taps_back * D; };
   #endif
 
-  // Two conv strategies, dispatched at compile time on Channels:
-  //
-  //   - Channels <= 4 (A2 nano): full-block tap-major. The z accumulator lives
-  //     in the heap buffer across all taps, and for each tap the inner f-loop
-  //     iterates over all num_frames. This gives clang frame-level
-  //     parallelism — it vectorizes across 4 frames at a time, which matters
-  //     more than weight-reload cost when the b-loop (3 wide) can't saturate
-  //     NEON lanes on its own.
-  //
-  //   - Channels >= 8 (A2 standard): frame-tiled tap-major with T=4. ztile
-  //     stays in NEON registers across all K taps, amortizing weight loads
-  //     over 4 frames — equivalent to what a GEMM kernel does. Weight reuse
-  //     matters here because the b-loop (8 wide) already saturates SIMD, so
-  //     frame-level parallelism gives no extra headroom. The 1x1 residual is
-  //     also tiled over the same T=4 frames so W1x1 loads are amortized.
-
   if constexpr (Channels == 3)
   {
-    // Inner 3x3 GEMV fully unrolled: all 9 weights lifted into named consts
-    // before the frame loop, the c-reduction kept in scalar temps a0/a1/a2 so
-    // the compiler keeps them in FP registers across the frame loop. Mirrors
-    // the nam2c --fused structure.
     float* z = _z.data();
-
-    // Tap 0: seed z with conv_b (saves the memset-to-zero pass) and fold in
-    // the first tap's FMAs.
     {
       const float* wk = &L.conv_w[0];
       const int tap_base = tap_base_phys(K - 1);
@@ -465,24 +420,16 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
       const float cb0 = L.conv_b[0], cb1 = L.conv_b[1], cb2 = L.conv_b[2];
       for (int f = 0; f < num_frames; f++)
       {
-        const float* src = &L.history[static_cast<size_t>(tap_base + f) * 3];
+        const float* src = L.history + static_cast<size_t>(tap_base + f) * 3;
         float a0 = cb0 + w0 * src[0];
         float a1 = cb1 + w1 * src[0];
         float a2 = cb2 + w2 * src[0];
-        a0 += w3 * src[1];
-        a1 += w4 * src[1];
-        a2 += w5 * src[1];
-        a0 += w6 * src[2];
-        a1 += w7 * src[2];
-        a2 += w8 * src[2];
+        a0 += w3 * src[1]; a1 += w4 * src[1]; a2 += w5 * src[1];
+        a0 += w6 * src[2]; a1 += w7 * src[2]; a2 += w8 * src[2];
         float* zf = z + static_cast<size_t>(f) * 3;
-        zf[0] = a0;
-        zf[1] = a1;
-        zf[2] = a2;
+        zf[0] = a0; zf[1] = a1; zf[2] = a2;
       }
     }
-
-    // Taps 1..K-2: accumulate into z with the same unrolled inner kernel.
     for (int k = 1; k < K - 1; k++)
     {
       const float* wk = &L.conv_w[static_cast<size_t>(k) * 9];
@@ -492,74 +439,43 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
       const float w6 = wk[6], w7 = wk[7], w8 = wk[8];
       for (int f = 0; f < num_frames; f++)
       {
-        const float* src = &L.history[static_cast<size_t>(tap_base + f) * 3];
+        const float* src = L.history + static_cast<size_t>(tap_base + f) * 3;
         float* zf = z + static_cast<size_t>(f) * 3;
         float a0 = zf[0] + w0 * src[0];
         float a1 = zf[1] + w1 * src[0];
         float a2 = zf[2] + w2 * src[0];
-        a0 += w3 * src[1];
-        a1 += w4 * src[1];
-        a2 += w5 * src[1];
-        a0 += w6 * src[2];
-        a1 += w7 * src[2];
-        a2 += w8 * src[2];
-        zf[0] = a0;
-        zf[1] = a1;
-        zf[2] = a2;
+        a0 += w3 * src[1]; a1 += w4 * src[1]; a2 += w5 * src[1];
+        a0 += w6 * src[2]; a1 += w7 * src[2]; a2 += w8 * src[2];
+        zf[0] = a0; zf[1] = a1; zf[2] = a2;
       }
     }
-
-    // Final tap (K-1, offset 0) fully inlined with the post-conv tail.
-    // Everything runs on register-resident scalars:
-    //   conv tap K-1 -> mixin -> LeakyReLU -> head_sum += -> layer1x1 residual.
     const float* wk_last = &L.conv_w[static_cast<size_t>(K - 1) * 9];
     const int tap_base_last = tap_base_phys(0);
     const float cw0 = wk_last[0], cw1 = wk_last[1], cw2 = wk_last[2];
     const float cw3 = wk_last[3], cw4 = wk_last[4], cw5 = wk_last[5];
     const float cw6 = wk_last[6], cw7 = wk_last[7], cw8 = wk_last[8];
     const float mw0 = L.mixin_w[0], mw1 = L.mixin_w[1], mw2 = L.mixin_w[2];
-    // layer1x1 col-major: lw[b*3 + c] is weight from bottleneck b to output c.
     const float lw00 = L.l1x1_w[0], lw01 = L.l1x1_w[1], lw02 = L.l1x1_w[2];
     const float lw10 = L.l1x1_w[3], lw11 = L.l1x1_w[4], lw12 = L.l1x1_w[5];
     const float lw20 = L.l1x1_w[6], lw21 = L.l1x1_w[7], lw22 = L.l1x1_w[8];
     const float lb0 = L.l1x1_b[0], lb1 = L.l1x1_b[1], lb2 = L.l1x1_b[2];
     for (int f = 0; f < num_frames; f++)
     {
-      const float* src = &L.history[static_cast<size_t>(tap_base_last + f) * 3];
+      const float* src = L.history + static_cast<size_t>(tap_base_last + f) * 3;
       const float* zf_mem = z + static_cast<size_t>(f) * 3;
-      // Final tap GEMV.
       float a0 = zf_mem[0] + cw0 * src[0];
       float a1 = zf_mem[1] + cw1 * src[0];
       float a2 = zf_mem[2] + cw2 * src[0];
-      a0 += cw3 * src[1];
-      a1 += cw4 * src[1];
-      a2 += cw5 * src[1];
-      a0 += cw6 * src[2];
-      a1 += cw7 * src[2];
-      a2 += cw8 * src[2];
-      // Mixin + LeakyReLU.
+      a0 += cw3 * src[1]; a1 += cw4 * src[1]; a2 += cw5 * src[1];
+      a0 += cw6 * src[2]; a1 += cw7 * src[2]; a2 += cw8 * src[2];
       const float cf = cond[f];
-      a0 += mw0 * cf;
-      a1 += mw1 * cf;
-      a2 += mw2 * cf;
+      a0 += mw0 * cf; a1 += mw1 * cf; a2 += mw2 * cf;
       a0 = (a0 >= 0.0f) ? a0 : a0 * kLeakySlope;
       a1 = (a1 >= 0.0f) ? a1 : a1 * kLeakySlope;
       a2 = (a2 >= 0.0f) ? a2 : a2 * kLeakySlope;
-      // Write/accumulate directly into _head_history at the current ring slot.
       float* hslot = &_head_history[static_cast<size_t>(head_wp + f) * 3];
-      if constexpr (IsFirst)
-      {
-        hslot[0] = a0;
-        hslot[1] = a1;
-        hslot[2] = a2;
-      }
-      else
-      {
-        hslot[0] += a0;
-        hslot[1] += a1;
-        hslot[2] += a2;
-      }
-      // layer1x1 residual (elided on the final layer: its output is dead).
+      if constexpr (IsFirst) { hslot[0] = a0; hslot[1] = a1; hslot[2] = a2; }
+      else                   { hslot[0] += a0; hslot[1] += a1; hslot[2] += a2; }
       if constexpr (!IsLast)
       {
         float* lin = &_layer_in[static_cast<size_t>(f) * 3];
@@ -571,19 +487,6 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
   }
   else
   {
-    // Use Eigen's tuned 8x8 × 8xN GEMM for the whole block at once. Unlike a
-    // small-tile version, this hits Eigen's actual GEMM kernel (tuned for
-    // inner dimensions of ~64) rather than its tiny-matrix fallback path.
-    //
-    // Compile-time improvements over the generic WaveNet path:
-    //   - Channels and Bottleneck are template constants (no dynamic shape).
-    //   - Per-layer buffers are pre-sized at SetMaxBufferSize; nothing resizes
-    //     during process().
-    //   - No FiLM / gating / head1x1 / grouped-conv branches.
-    //   - No virtual dispatch / conditional on optional layer features.
-    //   - All conv + post-conv ops operate on the full block — even the
-    //     mixin, bias, activation, and 1x1 residual are Eigen block ops so
-    //     they vectorize the same way the GEMMs do.
     using MatCC = Eigen::Matrix<float, Channels, Channels>;
     using MatCDyn = Eigen::Matrix<float, Channels, Eigen::Dynamic>;
     using VecC = Eigen::Matrix<float, Channels, 1>;
@@ -599,91 +502,34 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     Eigen::Map<MatCDyn> hslot_block(&_head_history[static_cast<size_t>(head_wp) * Channels], Channels, num_frames);
     Eigen::Map<MatCDyn> lin_block(_layer_in.data(), Channels, num_frames);
 
-    // Conv: T=4 frame-tiled, tap-major.
-    //
-    // For each tile of T=4 frames, accumulate all K taps and all Channels input
-    // channels into T*Channels output accumulators kept in local storage. The
-    // inner loop body is:
-    //
-    //   a[f][o] += Wcol[o] * h[f]   (o vectorized, h[f] scalar broadcast)
-    //
-    // where Wcol = W[:,cp] is stride-1 in o and h[f] = history[col+f][cp] is a
-    // scalar. On AArch64 the compiler emits vmlaq_n_f32 (SIMD FMA with scalar
-    // broadcast) with weight vector Wcol reused across all T frames — the same
-    // weight amortisation as an explicit NEON microkernel, without intrinsics.
-    // Equivalent SIMD broadcast-FMA instructions are emitted on x86 (AVX) and
-    // other SIMD targets automatically.
+    ztile.setZero();
+
+    // Conv: one Channels×Channels × Channels×N GEMM per tap (Eigen tuned kernel).
+    for (int k = 0; k < K; k++)
     {
-      float* z = _z.data();
-      constexpr int T = 4;
-      const int nF4 = (num_frames / T) * T;
-
-      for (int f = 0; f < nF4; f += T)
-      {
-        float a[T][Channels]{}; // zero-init; register-allocated by compiler
-
-        for (int k = 0; k < K; k++)
-        {
-          const float* W = &L.conv_w[static_cast<size_t>(k) * Channels * Channels];
-          const float* hb = L.history + static_cast<size_t>(tap_base_phys(K - 1 - k) + f) * Channels;
-          for (int cp = 0; cp < Channels; cp++)
-          {
-            const float* Wcol = W + cp * Channels; // stride-1 → vectorized over o
-            const float h0 = hb[cp], h1 = hb[Channels + cp], h2 = hb[2 * Channels + cp], h3 = hb[3 * Channels + cp];
-            for (int o = 0; o < Channels; o++)
-            {
-              a[0][o] += Wcol[o] * h0;
-              a[1][o] += Wcol[o] * h1;
-              a[2][o] += Wcol[o] * h2;
-              a[3][o] += Wcol[o] * h3;
-            }
-          }
-        }
-        for (int ti = 0; ti < T; ti++)
-          std::memcpy(z + static_cast<size_t>(f + ti) * Channels, a[ti], Channels * sizeof(float));
-      }
-
-      // Scalar tail for any frames past the T-aligned boundary.
-      for (int f = nF4; f < num_frames; f++)
-      {
-        float* zf = z + static_cast<size_t>(f) * Channels;
-        for (int o = 0; o < Channels; o++)
-          zf[o] = 0.0f;
-        for (int k = 0; k < K; k++)
-        {
-          const float* W = &L.conv_w[static_cast<size_t>(k) * Channels * Channels];
-          const float* h = L.history + static_cast<size_t>(tap_base_phys(K - 1 - k) + f) * Channels;
-          for (int cp = 0; cp < Channels; cp++)
-          {
-            const float hv = h[cp];
-            const float* Wcol = W + cp * Channels;
-            for (int o = 0; o < Channels; o++)
-              zf[o] += Wcol[o] * hv;
-          }
-        }
-      }
+      const int tap_base = tap_base_phys(K - 1 - k);
+      Eigen::Map<const MatCC> W(&L.conv_w[static_cast<size_t>(k) * Channels * Channels]);
+      Eigen::Map<const MatCDyn> input_block(L.history + static_cast<size_t>(tap_base) * Channels, Channels, num_frames);
+      ztile.noalias() += W * input_block;
     }
 
-    // Post-conv: bias, mixin, LeakyReLU, head accumulate, 1x1 residual.
+    // Post-conv: bias, mixin, LeakyReLU, direct head write, 1x1 residual.
     ztile.colwise() += conv_b_vec;
-    ztile.noalias() += mixin_vec * cond_row; // rank-1 outer product
+    ztile.noalias() += mixin_vec * cond_row;
     ztile = (ztile.array() < 0.0f).select(ztile.array() * kLeakySlope, ztile.array());
     if constexpr (IsFirst)
       hslot_block = ztile;
     else
       hslot_block += ztile;
-    // layer1x1 residual (elided on the final layer: its output is dead).
     if constexpr (!IsLast)
     {
-      lin_block.noalias() += l1x1_mat * ztile; // 8x8 × 8xN GEMM
+      lin_block.noalias() += l1x1_mat * ztile;
       lin_block.colwise() += l1x1_b_vec;
     }
   }
 }
 
-// Runtime dispatcher: selects the K-specialized kernel for this layer.
-// For the A2 shape the detector only admits K in {6, 15}; any other value
-// here means something passed the detector that shouldn't have.
+// Runtime dispatcher.
 template <int Channels>
 void A2FastModel<Channels>::_layer_forward(int layer_idx, const float* cond, int num_frames, bool is_first,
                                            bool is_last, int head_wp)
@@ -694,20 +540,14 @@ void A2FastModel<Channels>::_layer_forward(int layer_idx, const float* cond, int
   switch (L.kernel_size)
   {
     case 6:
-      if (is_first)
-        _layer_forward_k<6, true, false>(L, cond, num_frames, head_wp);
-      else if (is_last)
-        _layer_forward_k<6, false, true>(L, cond, num_frames, head_wp);
-      else
-        _layer_forward_k<6, false, false>(L, cond, num_frames, head_wp);
+      if (is_first)       _layer_forward_k<6, true,  false>(L, cond, num_frames, head_wp);
+      else if (is_last)   _layer_forward_k<6, false, true >(L, cond, num_frames, head_wp);
+      else                _layer_forward_k<6, false, false>(L, cond, num_frames, head_wp);
       break;
     case 15:
-      if (is_first)
-        _layer_forward_k<15, true, false>(L, cond, num_frames, head_wp);
-      else if (is_last)
-        _layer_forward_k<15, false, true>(L, cond, num_frames, head_wp);
-      else
-        _layer_forward_k<15, false, false>(L, cond, num_frames, head_wp);
+      if (is_first)       _layer_forward_k<15, true,  false>(L, cond, num_frames, head_wp);
+      else if (is_last)   _layer_forward_k<15, false, true >(L, cond, num_frames, head_wp);
+      else                _layer_forward_k<15, false, false>(L, cond, num_frames, head_wp);
       break;
     default: throw std::runtime_error("A2FastModel: unexpected kernel_size " + std::to_string(L.kernel_size));
   }
@@ -768,34 +608,35 @@ void A2FastModel<Channels>::process(NAM_SAMPLE** input, NAM_SAMPLE** output, int
       lin[c] = _rechannel_w[c] * x;
   }
 
-  // Advance the head ring write position. Rewind if writing num_frames more
-  // would overflow the contiguous range, preserving the K-1 lookback window.
-  const int head_keep = kHeadKernelSize - 1;
+  // Advance head ring write position and compute where layers write this block.
   #if NAM_A2_RING_MODE == 1
-  const int head_cap = _head_pow2_size;
-  #else
-  const int head_cap = _head_history_cols;
-  #endif
-  if (_head_write_pos + num_frames > head_cap)
-  {
-    std::memmove(_head_history.data(),
-                 _head_history.data() + static_cast<size_t>(_head_write_pos - head_keep) * Channels,
-                 static_cast<size_t>(head_keep) * Channels * sizeof(float));
-    _head_write_pos = head_keep;
-  }
   const int head_wp = _head_write_pos;
-
-  // Layer forward: layer 0 assigns into _head_history (IsFirst=true),
-  // layers 1-22 accumulate (IsFirst=false). No separate _head_sum buffer needed.
-  _layer_forward(0, cond, num_frames, /*is_first=*/true, /*is_last=*/false, head_wp);
-  for (int li = 1; li < kNumLayers; li++)
-    _layer_forward(li, cond, num_frames, /*is_first=*/false, /*is_last=*/li == kNumLayers - 1, head_wp);
-
-  // Advance the write position past this buffer's worth of frames.
-  #if NAM_A2_RING_MODE == 1
   _head_write_pos = (head_wp + num_frames) & _head_pow2_mask;
   #else
-  _head_write_pos = head_wp + num_frames;
+  if (_head_write_pos + num_frames > _head_history_cols)
+  {
+    const int keep = kHeadKernelSize - 1;
+    std::memmove(_head_history.data(),
+                 _head_history.data() + static_cast<size_t>(_head_write_pos - keep) * Channels,
+                 static_cast<size_t>(keep) * Channels * sizeof(float));
+    _head_write_pos = keep;
+  }
+  const int head_wp = _head_write_pos;
+  _head_write_pos += num_frames;
+  #endif
+
+  for (int li = 0; li < kNumLayers; li++)
+    _layer_forward(li, cond, num_frames, li == 0, li == kNumLayers - 1, head_wp);
+
+  // If Mode 1 and the layer writes spilled into the tail mirror region, reflect back to [0, overflow).
+  #if NAM_A2_RING_MODE == 1
+  if (head_wp + num_frames > _head_pow2_size)
+  {
+    const int overflow = head_wp + num_frames - _head_pow2_size;
+    std::memcpy(_head_history.data(),
+                _head_history.data() + static_cast<size_t>(_head_pow2_size) * Channels,
+                static_cast<size_t>(overflow) * Channels * sizeof(float));
+  }
   #endif
 
   // Output.
