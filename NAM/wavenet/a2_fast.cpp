@@ -36,7 +36,7 @@
       #include <immintrin.h>
     #elif defined(__SSE2__)
       #include <immintrin.h>
-    #elif defined(__ARM_NEON__)
+    #elif defined(__ARM_NEON__) || defined(__ARM_NEON)
       #include <arm_neon.h>
     #endif
   #endif
@@ -581,7 +581,7 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
           _mm_storeu_ps(lf + 4, _mm_add_ps(_mm_loadu_ps(lf + 4), acc_hi));
         }
       }
-  #elif NAM_A2_RESIDUAL_SIMD && defined(__ARM_NEON__) && (Channels == 8)
+  #elif NAM_A2_RESIDUAL_SIMD && (defined(__ARM_NEON__) || defined(__ARM_NEON)) && (Channels == 8)
       // NEON: two float32x4_t cover all 8 output channels per frame.
       {
         const float* w = L.l1x1_w.data();
