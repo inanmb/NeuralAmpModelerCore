@@ -27,6 +27,20 @@
 
   #include "../dsp.h"
 
+  #ifndef NAM_A2_RESIDUAL_SIMD
+    #define NAM_A2_RESIDUAL_SIMD 1
+  #endif
+
+  #if NAM_A2_RESIDUAL_SIMD
+    #if defined(__AVX__)
+      #include <immintrin.h>
+    #elif defined(__SSE2__)
+      #include <immintrin.h>
+    #elif defined(__ARM_NEON__)
+      #include <arm_neon.h>
+    #endif
+  #endif
+
 namespace nam
 {
 namespace wavenet
@@ -141,14 +155,13 @@ private:
   std::vector<float> _layer_in; // current layer input / next layer input (in-place residual)
   std::vector<float> _z; // per-layer conv output accumulator (tap-major)
   std::vector<float> _cond; // float32 copy of the double NAM_SAMPLE input, reused each block
-  std::vector<float> _head_out; // float32 head output before writing to NAM_SAMPLE
 
   int _prewarm_samples = 0;
 
   void _load_weights(std::vector<float>& weights);
   void _ring_write(Layer& L, int num_frames);
   void _layer_forward(int layer_idx, const float* cond, int num_frames, bool is_first, bool is_last, int head_wp);
-  void _head_forward(float* output, int num_frames);
+  void _head_forward(NAM_SAMPLE* output, int outputStride, int num_frames);
 
   // Compile-time-specialized per-layer kernel. KernelSize is lifted to a
   // template parameter so clang can fully unroll the tap loop and schedule
@@ -299,7 +312,6 @@ void A2FastModel<Channels>::SetMaxBufferSize(int maxBufferSize)
   _layer_in.assign(static_cast<size_t>(Channels) * maxBufferSize, 0.0f);
   _z.assign(static_cast<size_t>(Channels) * maxBufferSize, 0.0f);
   _cond.assign(static_cast<size_t>(maxBufferSize), 0.0f);
-  _head_out.assign(static_cast<size_t>(maxBufferSize), 0.0f);
 
   std::array<size_t, kNumLayers> slot_sizes{};
   size_t arena_total = 0;
@@ -523,8 +535,80 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
       hslot_block += ztile;
     if constexpr (!IsLast)
     {
+      // l1x1 residual: lin[:,f] += b + W * z[:,f] for each frame f.
+      // W is col-major (Channels×Channels): W[:,i] = &l1x1_w[i*Channels] (contiguous).
+      // z is col-major: z[:,f] = &_z[f*Channels] (contiguous).
+      // lin is col-major: lin[:,f] = &_layer_in[f*Channels] (contiguous).
+      // SIMD strategy: vectorize over Channels output rows, one frame at a time.
+  #if NAM_A2_RESIDUAL_SIMD && defined(__AVX__) && (Channels == 8)
+      {
+        const float* w = L.l1x1_w.data();
+        const float* b = L.l1x1_b.data();
+        float* lin = _layer_in.data();
+        const float* z = _z.data();
+        const __m256 bias_v = _mm256_loadu_ps(b);
+        for (int f = 0; f < num_frames; f++)
+        {
+          const float* zf = z + f * Channels;
+          float* lf = lin + f * Channels;
+          __m256 acc = bias_v;
+          for (int i = 0; i < Channels; i++)
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_loadu_ps(w + i * Channels), _mm256_set1_ps(zf[i])));
+          _mm256_storeu_ps(lf, _mm256_add_ps(_mm256_loadu_ps(lf), acc));
+        }
+      }
+  #elif NAM_A2_RESIDUAL_SIMD && defined(__SSE2__) && (Channels == 8)
+      // SSE2: two 128-bit vectors cover all 8 output channels per frame.
+      {
+        const float* w = L.l1x1_w.data();
+        const float* b = L.l1x1_b.data();
+        float* lin = _layer_in.data();
+        const float* z = _z.data();
+        const __m128 bias_lo = _mm_loadu_ps(b);
+        const __m128 bias_hi = _mm_loadu_ps(b + 4);
+        for (int f = 0; f < num_frames; f++)
+        {
+          const float* zf = z + f * Channels;
+          float* lf = lin + f * Channels;
+          __m128 acc_lo = bias_lo, acc_hi = bias_hi;
+          for (int i = 0; i < Channels; i++)
+          {
+            const __m128 sv = _mm_set1_ps(zf[i]);
+            acc_lo = _mm_add_ps(acc_lo, _mm_mul_ps(_mm_loadu_ps(w + i * Channels),     sv));
+            acc_hi = _mm_add_ps(acc_hi, _mm_mul_ps(_mm_loadu_ps(w + i * Channels + 4), sv));
+          }
+          _mm_storeu_ps(lf,     _mm_add_ps(_mm_loadu_ps(lf),     acc_lo));
+          _mm_storeu_ps(lf + 4, _mm_add_ps(_mm_loadu_ps(lf + 4), acc_hi));
+        }
+      }
+  #elif NAM_A2_RESIDUAL_SIMD && defined(__ARM_NEON__) && (Channels == 8)
+      // NEON: two float32x4_t cover all 8 output channels per frame.
+      {
+        const float* w = L.l1x1_w.data();
+        const float* b = L.l1x1_b.data();
+        float* lin = _layer_in.data();
+        const float* z = _z.data();
+        const float32x4_t bias_lo = vld1q_f32(b);
+        const float32x4_t bias_hi = vld1q_f32(b + 4);
+        for (int f = 0; f < num_frames; f++)
+        {
+          const float* zf = z + f * Channels;
+          float* lf = lin + f * Channels;
+          float32x4_t acc_lo = bias_lo, acc_hi = bias_hi;
+          for (int i = 0; i < Channels; i++)
+          {
+            const float sv = zf[i];
+            acc_lo = vmlaq_n_f32(acc_lo, vld1q_f32(w + i * Channels),     sv);
+            acc_hi = vmlaq_n_f32(acc_hi, vld1q_f32(w + i * Channels + 4), sv);
+          }
+          vst1q_f32(lf,     vaddq_f32(vld1q_f32(lf),     acc_lo));
+          vst1q_f32(lf + 4, vaddq_f32(vld1q_f32(lf + 4), acc_hi));
+        }
+      }
+  #else
       lin_block.noalias() += l1x1_mat * ztile;
       lin_block.colwise() += l1x1_b_vec;
+  #endif
     }
   }
 }
@@ -559,7 +643,7 @@ void A2FastModel<Channels>::_layer_forward(int layer_idx, const float* cond, int
 // process() writes all 23 layers' activations directly into _head_history
 // before calling this function, and has already advanced _head_write_pos.
 template <int Channels>
-void A2FastModel<Channels>::_head_forward(float* output, int num_frames)
+void A2FastModel<Channels>::_head_forward(NAM_SAMPLE* output, int outputStride, int num_frames)
 {
   #if NAM_A2_RING_MODE == 1
   const int mask = _head_pow2_mask;
@@ -580,7 +664,7 @@ void A2FastModel<Channels>::_head_forward(float* output, int num_frames)
       for (int b = 0; b < Channels; b++)
         y += wk[b] * src[b];
     }
-    output[f] = y * _head_scale;
+    output[static_cast<size_t>(f) * outputStride] = static_cast<NAM_SAMPLE>(y * _head_scale);
   }
 }
 
@@ -639,11 +723,7 @@ void A2FastModel<Channels>::process(NAM_SAMPLE** input, NAM_SAMPLE** output, int
   }
   #endif
 
-  // Output.
-  float* head_out = _head_out.data();
-  _head_forward(head_out, num_frames);
-  for (int f = 0; f < num_frames; f++)
-    out0[f] = static_cast<NAM_SAMPLE>(head_out[f]);
+  _head_forward(out0, 1, num_frames);
 }
 
 // -----------------------------------------------------------------------------
