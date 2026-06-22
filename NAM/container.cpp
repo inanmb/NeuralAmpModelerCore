@@ -145,6 +145,30 @@ std::unique_ptr<ModelConfig> create_config(const nlohmann::json& config, double 
   return c;
 }
 
+bool ContainerModel::SupportsStridedProcess() const
+{
+  const size_t idx = _active_index.load(std::memory_order_acquire);
+  return idx < _submodels.size() && _submodels[idx].model
+         && _submodels[idx].model->SupportsStridedProcess();
+}
+
+void ContainerModel::process_strided(const NAM_SAMPLE* input, int inputStride, NAM_SAMPLE* output,
+                                     int outputStride, const int num_frames)
+{
+  const size_t idx = _active_index.load(std::memory_order_acquire);
+  if (idx < _submodels.size() && _submodels[idx].model
+      && _submodels[idx].model->SupportsStridedProcess())
+    _submodels[idx].model->process_strided(input, inputStride, output, outputStride, num_frames);
+}
+
+std::unique_ptr<DSP> ContainerModel::CloneForPhase() const
+{
+  const size_t idx = _active_index.load(std::memory_order_acquire);
+  if (idx >= _submodels.size() || !_submodels[idx].model)
+    return nullptr;
+  return _submodels[idx].model->CloneForPhase();
+}
+
 // Auto-register
 static ConfigParserHelper _register_SlimmableContainer("SlimmableContainer", create_config);
 

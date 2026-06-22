@@ -44,10 +44,13 @@ public:
   /// \param expected_sample_rate Expected sample rate in Hz (-1.0 if unknown)
   WaveNet(const int in_channels, const std::vector<LayerArrayParams>& layer_array_params, const float head_scale,
           const bool with_head, std::optional<HeadParams> head_params, std::vector<float> weights,
-          std::unique_ptr<DSP> condition_dsp, const double expected_sample_rate = -1.0);
+          std::unique_ptr<DSP> condition_dsp, const double expected_sample_rate = -1.0,
+          nlohmann::json clone_config = {});
 
   /// \brief Destructor
   ~WaveNet() = default;
+
+  std::unique_ptr<DSP> CloneForPhase() const override;
 
   /// \brief Process audio frames
   ///
@@ -112,6 +115,10 @@ private:
 
   int mPrewarmSamples = 0; // Pre-compute during initialization
   int PrewarmSamples() override { return mPrewarmSamples; };
+
+  nlohmann::json _clone_config;
+  std::vector<float> _clone_weights;
+  int _time_scale = 1;
 };
 
 /// \brief Configuration for a WaveNet model
@@ -130,6 +137,8 @@ struct WaveNetConfig : public ModelConfig
   WaveNetConfig& operator=(WaveNetConfig&&) = default;
   WaveNetConfig(const WaveNetConfig&) = delete;
   WaveNetConfig& operator=(const WaveNetConfig&) = delete;
+
+  nlohmann::json raw_config;
 
   std::unique_ptr<DSP> create(std::vector<float> weights, double sampleRate) override;
 };

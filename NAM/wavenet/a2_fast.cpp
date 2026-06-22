@@ -51,6 +51,8 @@ namespace a2_fast
 namespace
 {
 
+using AlignedFloatVector = std::vector<float, Eigen::aligned_allocator<float>>;
+
 // =============================================================================
 // A2FastModel<Channels>
 //
@@ -80,6 +82,7 @@ public:
   ~A2FastModel() override = default;
 
   void process(NAM_SAMPLE** input, NAM_SAMPLE** output, int num_frames) override;
+  std::unique_ptr<DSP> CloneForPhase() const override;
 
 protected:
   void SetMaxBufferSize(int maxBufferSize) override;
@@ -94,7 +97,7 @@ private:
 
     // Dilated conv (Channels -> Bottleneck), column-major per tap.
     // Flat size = kernel_size * Channels * Bottleneck.
-    std::vector<float> conv_w;
+    AlignedFloatVector conv_w;
     std::array<float, Channels> conv_b{};
 
     // Input mixin (cond_size=1 -> Bottleneck), no bias.
@@ -138,7 +141,7 @@ private:
   float _head_scale = 1.0f;
 
   // Head ring buffer (Channels rows, col-major). Same ring layout as per-layer.
-  std::vector<float> _head_history;
+  AlignedFloatVector _head_history;
   #if NAM_A2_RING_MODE == 1
   int _head_pow2_size = 0;
   int _head_pow2_mask = 0;
@@ -149,14 +152,15 @@ private:
   #endif
 
   // Single contiguous allocation for all 23 layers' history buffers.
-  std::vector<float> _history_arena;
+  AlignedFloatVector _history_arena;
 
   // Working buffers (all Channels rows, max_buffer_size cols, col-major).
-  std::vector<float> _layer_in; // current layer input / next layer input (in-place residual)
-  std::vector<float> _z; // per-layer conv output accumulator (tap-major)
-  std::vector<float> _cond; // float32 copy of the double NAM_SAMPLE input, reused each block
+  AlignedFloatVector _layer_in; // current layer input / next layer input (in-place residual)
+  AlignedFloatVector _z; // per-layer conv output accumulator (tap-major)
+  AlignedFloatVector _cond; // float32 copy of the double NAM_SAMPLE input, reused each block
 
   int _prewarm_samples = 0;
+  AlignedFloatVector _weights_for_clone;
 
   void _load_weights(std::vector<float>& weights);
   void _ring_write(Layer& L, int num_frames);
@@ -187,6 +191,7 @@ A2FastModel<Channels>::A2FastModel(std::vector<float> weights, double expected_s
     _layers[i].conv_w.assign(static_cast<size_t>(kKernelSizes[i]) * Channels * Channels, 0.0f);
   }
 
+  _weights_for_clone = weights;
   _load_weights(weights);
 
   int prewarm = 0;
@@ -194,6 +199,12 @@ A2FastModel<Channels>::A2FastModel(std::vector<float> weights, double expected_s
     prewarm += _layers[i].max_lookback;
   prewarm += kHeadKernelSize - 1;
   _prewarm_samples = prewarm;
+}
+
+template <int Channels>
+std::unique_ptr<DSP> A2FastModel<Channels>::CloneForPhase() const
+{
+  return std::make_unique<A2FastModel<Channels>>(_weights_for_clone, GetExpectedSampleRate());
 }
 
 // -----------------------------------------------------------------------------
@@ -510,9 +521,9 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     Eigen::Map<const VecC> l1x1_b_vec(L.l1x1_b.data());
     Eigen::Map<const RowDyn> cond_row(cond, 1, num_frames);
 
-    Eigen::Map<MatCDyn> ztile(_z.data(), Channels, num_frames);
+    Eigen::Map<MatCDyn, Eigen::Aligned32> ztile(_z.data(), Channels, num_frames);
     Eigen::Map<MatCDyn> hslot_block(&_head_history[static_cast<size_t>(head_wp) * Channels], Channels, num_frames);
-    Eigen::Map<MatCDyn> lin_block(_layer_in.data(), Channels, num_frames);
+    Eigen::Map<MatCDyn, Eigen::Aligned32> lin_block(_layer_in.data(), Channels, num_frames);
 
     ztile.setZero();
 
@@ -520,7 +531,7 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     for (int k = 0; k < K; k++)
     {
       const int tap_base = tap_base_phys(K - 1 - k);
-      Eigen::Map<const MatCC> W(&L.conv_w[static_cast<size_t>(k) * Channels * Channels]);
+      Eigen::Map<const MatCC, Eigen::Aligned32> W(&L.conv_w[static_cast<size_t>(k) * Channels * Channels]);
       Eigen::Map<const MatCDyn> input_block(L.history + static_cast<size_t>(tap_base) * Channels, Channels, num_frames);
       ztile.noalias() += W * input_block;
     }

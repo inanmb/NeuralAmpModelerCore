@@ -557,4 +557,27 @@ std::unique_ptr<ModelConfig> create_config(const nlohmann::json& config, double 
 }
 
 } // namespace slimmable_wavenet
+
+bool SlimmableWavenet::SupportsStridedProcess() const
+{
+  return _active_model && _active_model->SupportsStridedProcess();
+}
+
+void SlimmableWavenet::process_strided(const NAM_SAMPLE* input, int inputStride,
+                                       NAM_SAMPLE* output, int outputStride, const int num_frames)
+{
+  if (auto staged = _pending_exchange_take_acq_rel())
+  {
+    _active_model = std::move(staged->model);
+    _current_channels = std::move(staged->channels);
+  }
+  if (_active_model && _active_model->SupportsStridedProcess())
+    _active_model->process_strided(input, inputStride, output, outputStride, num_frames);
+}
+
+std::unique_ptr<DSP> SlimmableWavenet::CloneForPhase() const
+{
+  return _active_model ? _active_model->CloneForPhase() : nullptr;
+}
+
 } // namespace nam

@@ -38,6 +38,10 @@ public:
   void prewarm() override;
   void Reset(const double sampleRate, const int maxBufferSize) override;
   void SetSlimmableSize(const double val) override;
+  bool SupportsStridedProcess() const override;
+  void process_strided(const NAM_SAMPLE* input, int inputStride, NAM_SAMPLE* output,
+                       int outputStride, const int num_frames) override;
+  std::unique_ptr<DSP> CloneForPhase() const override;
 
 protected:
   int PrewarmSamples() override { return 0; }
