@@ -556,8 +556,6 @@ std::unique_ptr<ModelConfig> create_config(const nlohmann::json& config, double 
   return sc;
 }
 
-} // namespace slimmable_wavenet
-
 bool SlimmableWavenet::SupportsStridedProcess() const
 {
   return _active_model && _active_model->SupportsStridedProcess();
@@ -580,4 +578,5 @@ std::unique_ptr<DSP> SlimmableWavenet::CloneForPhase() const
   return _active_model ? _active_model->CloneForPhase() : nullptr;
 }
 
+} // namespace slimmable_wavenet
 } // namespace nam

@@ -160,7 +160,7 @@ private:
   AlignedFloatVector _cond; // float32 copy of the double NAM_SAMPLE input, reused each block
 
   int _prewarm_samples = 0;
-  AlignedFloatVector _weights_for_clone;
+  std::vector<float> _weights_for_clone;
 
   void _load_weights(std::vector<float>& weights);
   void _ring_write(Layer& L, int num_frames);
